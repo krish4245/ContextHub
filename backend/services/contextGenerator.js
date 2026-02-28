@@ -136,15 +136,95 @@ async function generateContext(rootDir) {
   projectSummary.push(`**Estimated size:** ${Math.round(stats.size / 1024)} KB`);
 
   // directory tree (shallow)
-  const treeLines = buildTree(rootDir, 3);
+  const treeLines = buildTree(rootDir, 6);
 
-  // important files and previews
-  const important = listImportantFiles(rootDir);
-  const previews = [];
-  for (const rel of important) {
-    const p = path.join(rootDir, rel);
-    const content = readFirstLines(p, 200);
-    previews.push({ path: rel.replace(/\\/g, '/'), content });
+  // Walk entire tree to collect files
+  const files = [];
+  function walkAll(dir, rel = '') {
+    try {
+      const items = fs.readdirSync(dir, { withFileTypes: true });
+      for (const it of items) {
+        if (IGNORE.has(it.name)) continue;
+        const p = path.join(dir, it.name);
+        const r = rel ? path.join(rel, it.name) : it.name;
+        if (it.isDirectory()) walkAll(p, r);
+        else {
+          let size = 0;
+          try { size = fs.statSync(p).size; } catch (e) {}
+          files.push({ path: r.replace(/\\/g, '/'), full: p, size });
+        }
+      }
+    } catch (e) {}
+  }
+  walkAll(rootDir);
+
+  // Limits to avoid huge payloads
+  const PER_FILE_PREVIEW_LIMIT = 120 * 1024; // 120 KB per file
+  const TOTAL_PREVIEW_LIMIT = 1024 * 1024; // 1 MB total
+  let totalPreviewBytes = 0;
+
+  function isTextFile(ext) {
+    const txt = new Set(['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.c', '.cpp', '.h', '.html', '.css', '.json', '.md', '.txt', '.rb', '.go', '.rs', '.php', '.sh', '.yml', '.yaml']);
+    return txt.has(ext.toLowerCase());
+  }
+
+  function extractHeaderAndSymbols(content, ext) {
+    const headerCandidates = [];
+    const lines = content.split(/\r?\n/).slice(0, 200);
+    // try to find a leading comment block
+    if (/\.py$/.test(ext) || ext === '.py') {
+      for (const l of lines) { if (/^\s*#/.test(l)) headerCandidates.push(l.replace(/^\s*#\s?/, '')); else break; }
+    } else {
+      // languages with // or /* */
+      for (const l of lines) {
+        if (/^\s*\/\//.test(l)) headerCandidates.push(l.replace(/^\s*\/\/\s?/, ''));
+        else if (/^\s*\/\*/.test(l)) { headerCandidates.push(l.replace(/^\s*\/\*\s?/, '')); break; }
+        else break;
+      }
+    }
+    const header = headerCandidates.join(' ').trim();
+
+    // find symbols
+    const symbols = [];
+    const joined = lines.join('\n');
+    const jsFunc = joined.match(/function\s+([A-Za-z0-9_]+)/g) || [];
+    const jsClass = joined.match(/class\s+([A-Za-z0-9_]+)/g) || [];
+    const pyDef = joined.match(/def\s+([A-Za-z0-9_]+)/g) || [];
+    const pyClass = joined.match(/class\s+([A-Za-z0-9_]+)/g) || [];
+    [...jsFunc, ...jsClass, ...pyDef, ...pyClass].forEach((m) => {
+      const name = m.split(/\s+/).pop().replace('(', '').replace(/\W/g, '');
+      if (name && !symbols.includes(name)) symbols.push(name);
+    });
+
+    return { header: header || null, symbols };
+  }
+
+  const perFileSummaries = [];
+  for (const f of files) {
+    const ext = path.extname(f.path).toLowerCase();
+    let preview = null;
+    let text = null;
+    let isText = isTextFile(ext);
+    if (isText) {
+      const remaining = TOTAL_PREVIEW_LIMIT - totalPreviewBytes;
+      if (remaining > 0) {
+        const want = Math.min(PER_FILE_PREVIEW_LIMIT, remaining);
+        const c = safeRead(f.full, want);
+        if (c) {
+          preview = c;
+          totalPreviewBytes += Buffer.byteLength(preview, 'utf8');
+          text = preview;
+        }
+      }
+    }
+    let header = null;
+    let symbols = [];
+    if (text) {
+      const r = extractHeaderAndSymbols(text, ext);
+      header = r.header;
+      symbols = r.symbols;
+    }
+    perFileSummaries.push({ path: f.path, size: f.size, ext, header, symbols, preview });
   }
 
   const fence = '```';
@@ -154,6 +234,7 @@ async function generateContext(rootDir) {
     'Summarize the project and list the main modules and where to start reading the code.',
     'Provide setup and run instructions for a developer on macOS and Windows.',
     'List potential issues to watch for when modifying the codebase.',
+    'Give a file-by-file summary of the repository, focusing on entry points and configuration files.'
   ];
 
   let out = header;
@@ -161,18 +242,27 @@ async function generateContext(rootDir) {
   out += projectSummary.map((l) => `- ${l}`).join('\n') + '\n\n';
 
   out += `## How to use this context\n\n`;
-  out += `Paste the following sections into your AI assistant to give a full project overview:\n\n- Project Summary\n- Important files with previews\n- Directory structure\n\n`;
+  out += `Paste the following sections into your AI assistant to give a full project overview:\n\n- Project Summary\n- File index with previews\n- Directory structure\n\n`;
 
   out += `## Suggested AI Prompts\n\n` + prompts.map((p) => `- ${p}`).join('\n') + '\n\n';
 
   out += `## Directory structure (shallow)\n\n` + treeLines.join('\n') + '\n\n';
 
-  out += `## Important files and previews\n\n`;
-  if (previews.length === 0) out += '_No important files found._\n\n';
+  out += `## File index and summaries (per-file)\n\n`;
+  if (perFileSummaries.length === 0) out += '_No files found._\n\n';
   else {
-    for (const f of previews) {
-      const safe = (f.content || '').slice(0, 120 * 1024);
-      out += `### ${f.path}\n\n${f.path.endsWith('.md') ? safe : fence + '\n' + safe + '\n' + fence}` + '\n\n';
+    for (const f of perFileSummaries) {
+      out += `### ${f.path} — ${Math.round(f.size / 1024)} KB\n\n`;
+      const meta = [];
+      meta.push(`- extension: ${f.ext || '(none)'}`);
+      if (f.header) meta.push(`- header: ${f.header}`);
+      if (f.symbols && f.symbols.length) meta.push(`- symbols: ${f.symbols.slice(0,8).join(', ')}`);
+      out += meta.join('\n') + '\n\n';
+      if (f.preview) {
+        out += `${fence}\n${f.preview}\n${fence}\n\n`;
+      } else {
+        out += '_No preview available (binary or trimmed)._\n\n';
+      }
     }
   }
 
